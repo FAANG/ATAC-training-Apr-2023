@@ -1,0 +1,257 @@
+---
+title: "AQUA-FAANG Training April 2023"
+author: "Malcolm Perry"
+date: '2023-04-18'
+output: html_document
+---
+
+Some general packages:
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+## PWM Kata
+
+Start with simulated SELEX data
+
+```{r, message=FALSE, warning=FALSE}
+library(Biostrings)
+seqs = readDNAStringSet("data/ALX3.fa")
+```
+
+Count frequency:
+
+```{r}
+PFM = consensusMatrix(seqs)[1:4,] # ignore non ACGT-bases
+colnames(PFM) = 1:ncol(PFM)
+print(PFM)
+```
+
+Calculate PPM with pseudocount:
+
+```{r}
+PFM_adj = PFM + 0.8
+PPM = PFM/colSums(PFM)[col(PFM)]
+print(PPM)
+```
+
+Calculate PWM:
+
+```{r}
+background = c(A=0.25, C=0.25, G=0.25, T=0.25)
+
+PWM = log2(PPM/background) # R recycling trick
+print(PWM)
+```
+
+Display sequence logo:
+
+```{r}
+library(seqLogo)
+seqLogo::seqLogo(PPM)
+```
+
+Interestingly, this TF binds a dimer, which you can clearly see in the logo.
+
+## AQUA-FAANG Analysis
+
+Now let's load PFMs downloaded from the Ensembl Regulation FTP site:
+
+```{r, warnings=FALSE, message=FALSE}
+library(jsonlite)
+library(TFBSTools)
+
+pfms = fromJSON("data/ensembl_pwms_mono_human.json", simplifyDataFrame = F)
+
+names(pfms) = map_chr(pfms, function(x) x$name)
+
+print(pfms$ALX3)
+```
+
+We can then use a function to convert these to PWMs:
+
+```{r}
+bg = c(A=0.25, C=0.25, G=0.25, T=0.25)
+
+make_pwm = function(motif, pseudocount, background=bg) {
+  count_matrix = motif$PFM
+  row.names(count_matrix) = c("A", "C", "G", "T")
+  pfm = PFMatrix(ID=motif$pfm_id, name=motif$name, profileMatrix = count_matrix)
+  toPWM(pfm, pseudocounts = pseudocount, bg = background)
+}
+```
+
+This function would work on any list with "PFM", "pfm_id", and "name" fields, so you can input your own TFs is source code as follows:
+
+```{r}
+# dummy matrix of all As:
+my_pfm = rbind(
+  rep(10, 10),
+  rep(0, 10),
+  rep(0, 10),
+  rep(0, 10)
+)
+
+my_tf = list(
+  pfm_id="TF0001",
+  name="my_tf",
+  PFM=my_pfm
+)
+
+make_pwm(my_tf, 0.8)
+```
+
+If you have PWMs (position *weight* matrices) instead of PFMs (position *frequency* matrices) then you can change the `make_pwm` function to use PWMatrix() instead of PFMatrix(), and omit the final line (toPWM()).
+
+```{r}
+pwm_list = map(pfms, make_pwm, pseudocount=0.8, background=bg)
+
+pwms = invoke(PWMatrixList, pwm_list[!duplicated(names(pwm_list))])
+```
+
+Now we need to find regions to scan with our PWMs. We're working with the ATAC-seq peaks
+which are output from Genrich as part of the Ensembl Regulation pipeline.
+
+The output from Genrich is the ENCODE narrowPeak format, which is the same as BED but with additional 
+columns. If we specify these columns we can use the `import` function from the Bioconductor package
+`rtracklayer` to load them. This way, we don't have to manually specify things like column names,
+variable types or 0-based coordinates.
+
+NB `map` is very similar to the base R function `lapply`
+
+```{r}
+library(rtracklayer)
+
+narrow_peak = c(
+  signalValue = "numeric",
+  pValue = "numeric",
+  qValue = "numeric",
+  peak = "integer"
+)
+
+import_narrowpeak = function(file) {
+  gr = import(file, extraCols=narrow_peak)
+  gr = gr[seqnames(gr) %in% as.character(1:29)] # filter out contigs
+  gr = keepStandardChromosomes(gr)
+  gr
+}
+
+liver_9m_peaks = import_narrowpeak("data/peaks-Ssal_v3.1-atac-seq-liver-m-9-m.bed")
+
+```
+
+As a background to compare against, we'll randomly shuffle these regions in the genome:
+
+```{r}
+library(regioneR)
+
+chroms = makeGRangesFromDataFrame(as.data.frame(read_csv("Ssal_v3.1.chroms")))
+
+background = regioneR::randomizeRegions(liver_9m_peaks, genome=chroms, per.chromosome = TRUE)
+```
+
+
+Now we have our PWMs are our peaks loaded and shuffled, we can use the excellent `motifmatchr` package
+to scan the selected regions of the genome for motif matches. It wraps the `MOODS` tool, which is an
+efficient C++ library for matching peaks. `motifmatchr` simplifies calling `MOODS` and returns the
+results directly into R in a useable format.
+
+```{r}
+library(motifmatchr)
+library(Rsamtools)
+
+intervals = list(
+  liver_9m = liver_9m_peaks,
+  background = background
+)
+
+# Loads Ssalmar genome with '.fai' index for quick access to subsequences
+Ssalar = FaFile("~/Data/Annotation/salmon/Salmo_salar.Ssal_v3.1.dna.toplevel.fa")
+
+motif_hits = map(intervals, function(gr) matchMotifs(pwms, gr, genome = Ssalar))
+```
+
+`matchMotifs` has returned a `SummarizedExperiment` object, a class that R uses to represent the
+results of multiple experiments or analyses in a single object. Internally, it uses an efficient sparse
+matrix class to store the PWM hits. We can get a sense of what the data look like by converting it
+to a simpler `GenomicRanges` object:
+
+```{r, warning=FALSE, message=FALSE}
+library(SummarizedExperiment) # load functions to work with SE class
+
+gr = granges(motif_hits$liver_9m)
+gr$ALX3 = as.integer(assays(motif_hits$liver_9m)$motifMatches[,"ALX3"])
+gr$CTCF = as.integer(assays(motif_hits$liver_9m)$motifMatches[,"CTCF"])
+
+gr
+```
+
+Quick check for enrichment:
+
+```{r}
+count_tf_hits = function(se) enframe(colSums(assays(se)$motifMatches))
+
+hit_df = map(motif_hits, count_tf_hits) %>%
+  bind_rows(.id="peaks") %>%
+  rename(name="TF", value="count") %>%
+  spread(peaks, count) %>%
+  mutate(ratio = liver_9m/background)
+```
+
+Plot motif enrichment:
+
+```{r}
+hit_df %>%
+  arrange(ratio) %>%
+  mutate(TF = factor(TF, levels=TF)) %>%
+  tail(50) %>% # top 50 TFs
+  ggplot(aes(x=TF, y=ratio)) +
+  geom_point(size=2) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylim(0, NA) +
+  geom_hline(yintercept = 1, lty=2)
+```
+
+NB Data not provided for the following chunks, so they will not be evaluated.
+
+Calculate enrichment for Nucleosome-free regions:
+
+```{r, eval=FALSE}
+liver_9m_nfr = import("data/liver_9m_m_nfr.bed")
+bg_nfr = regioneR::randomizeRegions(liver_9m_nfr, genome=chroms, per.chromosome = TRUE)
+
+intervals_nfr = list(
+  liver_9m_nfr = liver_9m_nfr,
+  background = bg_nfr
+)
+
+motif_hits_nfr = map(intervals_nfr, function(gr) matchMotifs(pwms, gr, genome = Ssalar))
+```
+
+Quick check for enrichment:
+
+```{r, eval=FALSE}
+hit_df_nfr = map(motif_hits_nfr, count_tf_hits) %>%
+  bind_rows(.id="peaks") %>%
+  rename(name="TF", value="count") %>%
+  spread(peaks, count) %>%
+  mutate(ratio = liver_9m_nfr/background) %>%
+  arrange(ratio)
+```
+
+Plot motif enrichment:
+
+```{r, eval=FALSE}
+bind_rows(list(ATAC=hit_df, NFR=hit_df_nfr), .id="source") %>%
+  select(TF, ratio, source) %>%
+  mutate(TF = factor(TF, levels=hit_df_nfr$TF)) %>%
+  arrange(TF) %>%
+  tail(50) %>% # top 50 TFs
+  ggplot(aes(x=TF, y=ratio)) +
+  geom_line(aes(group=TF)) +
+  geom_point(aes(colour=source), size=2) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylim(0, 15) +
+  geom_hline(yintercept = 1, lty=2)
+```
